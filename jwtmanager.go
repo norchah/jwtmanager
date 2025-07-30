@@ -23,13 +23,22 @@ func NewJWTManager(config *Config) (*JWTManager, error) {
 
 // GenerateAccessToken creates a new access token with the provided claims.
 func (m *JWTManager) GenerateAccessToken(claims Claims) (string, error) {
+	start := time.Now()
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	token.Header["kid"] = m.config.CurrentKeyID
-	return token.SignedString(m.config.PrivateKeys[m.config.CurrentKeyID])
+	signedToken, err := token.SignedString(m.config.PrivateKeys[m.config.CurrentKeyID])
+	if err != nil {
+		GenerateAccessTokenErrors.Inc()
+		return "", err
+	}
+	GenerateAccessTokenCounter.Inc()
+	GenerateAccessTokenDuration.Observe(time.Since(start).Seconds())
+	return signedToken, nil
 }
 
 // GenerateRefreshToken creates a new refresh token.
 func (m *JWTManager) GenerateRefreshToken(userID, deviceID string) (string, error) {
+	start := time.Now()
 	refreshToken := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
 		"sub":    userID,
 		"device": deviceID,
@@ -40,16 +49,20 @@ func (m *JWTManager) GenerateRefreshToken(userID, deviceID string) (string, erro
 	refreshToken.Header["kid"] = m.config.CurrentKeyID
 	token, err := refreshToken.SignedString(m.config.PrivateKeys[m.config.CurrentKeyID])
 	if err != nil {
+		GenerateRefreshTokenErrors.Inc()
 		return "", err
 	}
 	// Hash refresh token with SHA-256 for storage
 	hash := sha256.Sum256([]byte(token))
 	hashedToken := hex.EncodeToString(hash[:])
+	GenerateRefreshTokenCounter.Inc()
+	RefreshAccessTokenDuration.Observe(time.Since(start).Seconds())
 	return hashedToken, nil
 }
 
 // ValidateToken validates a JWT and returns its claims.
 func (m *JWTManager) ValidateToken(tokenString string) (Claims, error) {
+	start := time.Now()
 	claims := Claims{}
 	token, err := jwt.ParseWithClaims(tokenString, &claims, func(token *jwt.Token) (interface{}, error) {
 		kid, ok := token.Header["kid"].(string)
@@ -63,22 +76,33 @@ func (m *JWTManager) ValidateToken(tokenString string) (Claims, error) {
 		return publicKey, nil
 	})
 	if err != nil {
+		ValidateTokenErrors.Inc()
+		ValidateTokenDuration.Observe(time.Since(start).Seconds())
 		return Claims{}, err
 	}
 	if !token.Valid {
+		ValidateTokenErrors.Inc()
+		ValidateTokenDuration.Observe(time.Since(start).Seconds())
 		return Claims{}, ErrInvalidToken
 	}
 	if claims.Issuer != m.config.Issuer {
+		ValidateTokenErrors.Inc()
+		ValidateTokenDuration.Observe(time.Since(start).Seconds())
 		return Claims{}, ErrInvalidIssuer
 	}
+	ValidateTokenCounter.Inc()
+	ValidateTokenDuration.Observe(time.Since(start).Seconds())
 	return claims, nil
 }
 
 // RefreshAccessToken generates a new access token using a refresh token.
 func (m *JWTManager) RefreshAccessToken(refreshToken string, storage Storage) (string, Claims, error) {
+	start := time.Now()
 	// Validate refresh token in storage
 	userID, deviceID, err := storage.ValidateRefreshToken(refreshToken)
 	if err != nil {
+		RefreshAccessTokenErrors.Inc()
+		RefreshAccessTokenDuration.Observe(time.Since(start).Seconds())
 		return "", Claims{}, err
 	}
 	// Generate new access token with device_id in claims
@@ -94,7 +118,11 @@ func (m *JWTManager) RefreshAccessToken(refreshToken string, storage Storage) (s
 	}
 	newToken, err := m.GenerateAccessToken(claims)
 	if err != nil {
+		RefreshAccessTokenErrors.Inc()
+		RefreshAccessTokenDuration.Observe(time.Since(start).Seconds())
 		return "", Claims{}, err
 	}
+	RefreshAccessTokenCounter.Inc()
+	RefreshAccessTokenDuration.Observe(time.Since(start).Seconds())
 	return newToken, claims, nil
 }

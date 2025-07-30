@@ -4,11 +4,14 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/norchah/jwtmanager"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -405,6 +408,148 @@ func TestValidateTokenWithRotatedKey(t *testing.T) {
 	assert.NoError(t, err)
 	_, err = manager.ValidateToken(invalidToken)
 	assert.ErrorIs(t, err, jwtmanager.ErrInvalidKeyID)
+}
+
+func TestMetrics(t *testing.T) {
+	privateKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	config := &jwtmanager.Config{
+		AccessTTL:    time.Minute * 15,
+		RefreshTTL:   time.Hour * 24 * 7,
+		Issuer:       "auth-service",
+		PrivateKeys:  map[string]*rsa.PrivateKey{"1": privateKey},
+		PublicKeys:   map[string]*rsa.PublicKey{"1": &privateKey.PublicKey},
+		CurrentKeyID: "1",
+	}
+	manager, err := jwtmanager.NewJWTManager(config)
+	assert.NoError(t, err)
+
+	// Reset metrics for test
+	prometheus.DefaultRegisterer.Unregister(jwtmanager.GenerateAccessTokenCounter)
+	prometheus.DefaultRegisterer.Unregister(jwtmanager.ValidateTokenCounter)
+	prometheus.DefaultRegisterer.Unregister(jwtmanager.GenerateRefreshTokenCounter)
+	prometheus.DefaultRegisterer.Unregister(jwtmanager.RefreshAccessTokenCounter)
+	prometheus.DefaultRegisterer.Unregister(jwtmanager.GenerateAccessTokenErrors)
+	prometheus.DefaultRegisterer.Unregister(jwtmanager.GenerateRefreshTokenErrors)
+	prometheus.DefaultRegisterer.Unregister(jwtmanager.ValidateTokenErrors)
+	prometheus.DefaultRegisterer.Unregister(jwtmanager.RefreshAccessTokenErrors)
+	prometheus.DefaultRegisterer.Unregister(jwtmanager.GenerateAccessTokenDuration)
+	prometheus.DefaultRegisterer.Unregister(jwtmanager.ValidateTokenDuration)
+	prometheus.DefaultRegisterer.Unregister(jwtmanager.RefreshAccessTokenDuration)
+	// Re-register metrics
+	jwtmanager.GenerateAccessTokenCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "jwtmanager_generate_access_tokens_total",
+		Help: "Total number of generated access tokens",
+	})
+	jwtmanager.ValidateTokenCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "jwtmanager_validate_tokens_total",
+		Help: "Total number of validated tokens",
+	})
+	jwtmanager.GenerateRefreshTokenCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "jwtmanager_generate_refresh_tokens_total",
+		Help: "Total number of generated refresh tokens",
+	})
+	jwtmanager.RefreshAccessTokenCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "jwtmanager_refresh_access_tokens_total",
+		Help: "Total number of refreshed access tokens",
+	})
+	jwtmanager.GenerateAccessTokenErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "jwtmanager_generate_access_token_errors_total",
+		Help: "Total number of errors during access token generation",
+	})
+	jwtmanager.GenerateRefreshTokenErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "jwtmanager_generate_refresh_token_errors_total",
+		Help: "Total number of errors during refresh token generation",
+	})
+	jwtmanager.ValidateTokenErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "jwtmanager_validate_token_errors_total",
+		Help: "Total number of errors during token validation",
+	})
+	jwtmanager.RefreshAccessTokenErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "jwtmanager_refresh_access_token_errors_total",
+		Help: "Total number of errors during access token refresh",
+	})
+	jwtmanager.GenerateAccessTokenDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "jwtmanager_generate_access_token_duration_seconds",
+		Help:    "Latency of access token generation in seconds",
+		Buckets: prometheus.DefBuckets,
+	})
+	jwtmanager.ValidateTokenDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "jwtmanager_validate_token_duration_seconds",
+		Help:    "Latency of token validation in seconds",
+		Buckets: prometheus.DefBuckets,
+	})
+	jwtmanager.RefreshAccessTokenDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "jwtmanager_refresh_access_token_duration_seconds",
+		Help:    "Latency of access token refresh in seconds",
+		Buckets: prometheus.DefBuckets,
+	})
+
+	// Generate access token
+	claims := jwtmanager.Claims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(config.AccessTTL)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			Issuer:    config.Issuer,
+		},
+		Roles: []string{"user"},
+	}
+	token, err := manager.GenerateAccessToken(claims)
+	assert.NoError(t, err)
+
+	// Validate token
+	_, err = manager.ValidateToken(token)
+	assert.NoError(t, err)
+
+	// Generate refresh token
+	refreshToken, err := manager.GenerateRefreshToken("user123", "device1")
+	assert.NoError(t, err)
+
+	// Refresh access token
+	storage := &mockStorage{tokens: make(map[string]struct {
+		userID    string
+		deviceID  string
+		expiresAt time.Time
+	})}
+	err = storage.SaveRefreshToken(refreshToken, "user123", "device1", time.Now().Add(config.RefreshTTL))
+	assert.NoError(t, err)
+	_, _, err = manager.RefreshAccessToken(refreshToken, storage)
+	assert.NoError(t, err)
+
+	// Check counters
+	assert.Equal(t, 2.0, testutil.ToFloat64(jwtmanager.GenerateAccessTokenCounter), "GenerateAccessTokenCounter should be 2")
+	assert.Equal(t, 1.0, testutil.ToFloat64(jwtmanager.ValidateTokenCounter), "ValidateTokenCounter should be 1")
+	assert.Equal(t, 1.0, testutil.ToFloat64(jwtmanager.GenerateRefreshTokenCounter), "GenerateRefreshTokenCounter should be 1")
+	assert.Equal(t, 1.0, testutil.ToFloat64(jwtmanager.RefreshAccessTokenCounter), "RefreshAccessTokenCounter should be 1")
+	assert.Equal(t, 0.0, testutil.ToFloat64(jwtmanager.GenerateAccessTokenErrors), "GenerateAccessTokenErrors should be 0")
+	assert.Equal(t, 0.0, testutil.ToFloat64(jwtmanager.GenerateRefreshTokenErrors), "GenerateRefreshTokenErrors should be 0")
+	assert.Equal(t, 0.0, testutil.ToFloat64(jwtmanager.ValidateTokenErrors), "ValidateTokenErrors should be 0")
+	assert.Equal(t, 0.0, testutil.ToFloat64(jwtmanager.RefreshAccessTokenErrors), "RefreshAccessTokenErrors should be 0")
+
+	// Check histograms using CollectAndCompare (only count, as sum varies)
+	metrics := `
+		# HELP jwtmanager_generate_access_token_duration_seconds Latency of access token generation in seconds
+		# TYPE jwtmanager_generate_access_token_duration_seconds histogram
+		jwtmanager_generate_access_token_duration_seconds_count 2
+	`
+	err = testutil.CollectAndCompare(jwtmanager.GenerateAccessTokenDuration, strings.NewReader(metrics), "jwtmanager_generate_access_token_duration_seconds_count")
+	assert.NoError(t, err, "GenerateAccessTokenDuration should have 2 observations")
+
+	metrics = `
+		# HELP jwtmanager_validate_token_duration_seconds Latency of token validation in seconds
+		# TYPE jwtmanager_validate_token_duration_seconds histogram
+		jwtmanager_validate_token_duration_seconds_count 1
+	`
+	err = testutil.CollectAndCompare(jwtmanager.ValidateTokenDuration, strings.NewReader(metrics), "jwtmanager_validate_token_duration_seconds_count")
+	assert.NoError(t, err, "ValidateTokenDuration should have 1 observation")
+
+	metrics = `
+		# HELP jwtmanager_refresh_access_token_duration_seconds Latency of access token refresh in seconds
+		# TYPE jwtmanager_refresh_access_token_duration_seconds histogram
+		jwtmanager_refresh_access_token_duration_seconds_count 2
+	`
+	err = testutil.CollectAndCompare(jwtmanager.RefreshAccessTokenDuration, strings.NewReader(metrics), "jwtmanager_refresh_access_token_duration_seconds_count")
+	assert.NoError(t, err, "RefreshAccessTokenDuration should have 2 observations")
 }
 
 func BenchmarkGenerateAccessToken(b *testing.B) {

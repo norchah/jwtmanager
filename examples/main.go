@@ -5,24 +5,32 @@ import (
 	"crypto/rsa"
 	"fmt"
 	"log"
+	"net/http"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/norchah/jwtmanager"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
-	// Generate two RSA key pairs (in production, load from secure storage)
+	// Запуск Prometheus метрик
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		log.Fatal(http.ListenAndServe(":9090", nil))
+	}()
+
+	// Генерация ключей (в продакшене загружать из Yandex Cloud Secrets)
 	privateKey1, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		log.Fatalf("Failed to generate private key 1: %v", err)
+		log.Fatalf("Ошибка генерации ключа 1: %v", err)
 	}
 	privateKey2, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		log.Fatalf("Failed to generate private key 2: %v", err)
+		log.Fatalf("Ошибка генерации ключа 2: %v", err)
 	}
 
-	// Initialize JWTManager with multiple keys
+	// Инициализация JWTManager
 	config := &jwtmanager.Config{
 		AccessTTL:    time.Minute * 15,
 		RefreshTTL:   time.Hour * 24 * 7,
@@ -33,10 +41,10 @@ func main() {
 	}
 	manager, err := jwtmanager.NewJWTManager(config)
 	if err != nil {
-		log.Fatalf("Failed to initialize JWTManager: %v", err)
+		log.Fatalf("Ошибка инициализации JWTManager: %v", err)
 	}
 
-	// Generate access token with current key
+	// Генерация access-токена
 	claims := jwtmanager.Claims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   "user123",
@@ -47,31 +55,36 @@ func main() {
 		Roles:       []string{"user"},
 		DeviceID:    "device1",
 		MFAVerified: true,
+		TenantID:    "tenant1",
 	}
 	token, err := manager.GenerateAccessToken(claims)
 	if err != nil {
-		log.Fatalf("Failed to generate access token: %v", err)
+		log.Fatalf("Ошибка генерации access-токена: %v", err)
 	}
 	fmt.Printf("Access Token: %s\n", token)
 
-	// Validate token
+	// Валидация токена
 	parsedClaims, err := manager.ValidateToken(token)
 	if err != nil {
-		log.Fatalf("Failed to validate token: %v", err)
+		log.Fatalf("Ошибка валидации токена: %v", err)
 	}
 	fmt.Printf("Validated Claims: %+v\n", parsedClaims)
 
-	// Generate refresh token
+	// Генерация refresh-токена
 	refreshToken, err := manager.GenerateRefreshToken("user123", "device1")
 	if err != nil {
-		log.Fatalf("Failed to generate refresh token: %v", err)
+		log.Fatalf("Ошибка генерации refresh-токена: %v", err)
 	}
 	fmt.Printf("Refresh Token: %s\n", refreshToken)
 
-	// Get JWKS
+	// Получение JWKS
 	jwks, err := manager.GetJWKS()
 	if err != nil {
-		log.Fatalf("Failed to get JWKS: %v", err)
+		log.Fatalf("Ошибка получения JWKS: %v", err)
 	}
 	fmt.Printf("JWKS: %s\n", string(jwks))
+
+	// Метрики доступны по http://localhost:9090/metrics
+	fmt.Println("Метрики доступны по http://localhost:9090/metrics")
+	select {} // Чтобы сервер не завершался
 }
